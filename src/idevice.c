@@ -2,8 +2,8 @@
  * idevice.c
  * Device discovery and communication interface.
  *
+ * Copyright (c) 2009-2019 Nikias Bassen. All Rights Reserved.
  * Copyright (c) 2014 Martin Szulecki All Rights Reserved.
- * Copyright (c) 2009-2014 Nikias Bassen. All Rights Reserved.
  * Copyright (c) 2008 Zach C. All Rights Reserved.
  *
  * This library is free software; you can redistribute it and/or
@@ -37,19 +37,19 @@
 #ifdef HAVE_OPENSSL
 #include <openssl/err.h>
 #include <openssl/ssl.h>
-
 #else
 #include <gnutls/gnutls.h>
 #endif
 
 #include "idevice.h"
 #include "common/userpref.h"
+#include "common/socket.h"
 #include "common/thread.h"
 #include "common/debug.h"
 
 #ifdef HAVE_OPENSSL
 
-#if OPENSSL_VERSION_NUMBER < 0x10002000L
+#if OPENSSL_VERSION_NUMBER < 0x10002000L || defined(LIBRESSL_VERSION_NUMBER)
 static void SSL_COMP_free_compression_methods(void)
 {
 	sk_SSL_COMP_free(SSL_COMP_get_compression_methods());
@@ -60,7 +60,7 @@ static void openssl_remove_thread_state(void)
 {
 /*  ERR_remove_thread_state() is available since OpenSSL 1.0.0-beta1, but
  *  deprecated in OpenSSL 1.1.0 */
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 #if OPENSSL_VERSION_NUMBER >= 0x10000001L
 	ERR_remove_thread_state(NULL);
 #else
@@ -69,7 +69,7 @@ static void openssl_remove_thread_state(void)
 #endif
 }
 
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 static mutex_t *mutex_buf = NULL;
 static void locking_function(int mode, int n, const char* file, int line)
 {
@@ -89,7 +89,7 @@ static unsigned long id_function(void)
 static void internal_idevice_init(void)
 {
 #ifdef HAVE_OPENSSL
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 	int i;
 	SSL_library_init();
 
@@ -110,7 +110,7 @@ static void internal_idevice_init(void)
 static void internal_idevice_deinit(void)
 {
 #ifdef HAVE_OPENSSL
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 	int i;
 	if (mutex_buf) {
 		CRYPTO_set_id_callback(NULL);
@@ -382,6 +382,23 @@ LIBIMOBILEDEVICE_API idevice_error_t idevice_connection_send(idevice_connection_
 	return internal_connection_send(connection, data, len, sent_bytes);
 }
 
+static idevice_error_t socket_recv_to_idevice_error(int conn_error, uint32_t len, uint32_t received)
+{
+	if (conn_error < 0) {
+		switch (conn_error) {
+			case -EAGAIN:
+				debug_info("ERROR: received partial data %d/%d (%s)", received, len, strerror(-conn_error));
+				return IDEVICE_E_NOT_ENOUGH_DATA;
+			case -ETIMEDOUT:
+				return IDEVICE_E_TIMEOUT;
+			default:
+				return IDEVICE_E_UNKNOWN_ERROR;
+		}
+	}
+
+	return IDEVICE_E_SUCCESS;
+}
+
 /**
  * Internally used function for receiving raw data over the given connection
  * using a timeout.
@@ -393,12 +410,14 @@ static idevice_error_t internal_connection_receive_timeout(idevice_connection_t 
 	}
 
 	if (connection->type == CONNECTION_USBMUXD) {
-		int res = usbmuxd_recv_timeout((int)(long)connection->data, data, len, recv_bytes, timeout);
-		if (res < 0) {
-			debug_info("ERROR: usbmuxd_recv_timeout returned %d (%s)", res, strerror(errno));
-			return (res == -EAGAIN ? IDEVICE_E_NOT_ENOUGH_DATA : IDEVICE_E_UNKNOWN_ERROR);
+		int conn_error = usbmuxd_recv_timeout((int)(long)connection->data, data, len, recv_bytes, timeout);
+		idevice_error_t error = socket_recv_to_idevice_error(conn_error, len, *recv_bytes);
+
+		if (error == IDEVICE_E_UNKNOWN_ERROR) {
+			debug_info("ERROR: usbmuxd_recv_timeout returned %d (%s)", conn_error, strerror(-conn_error));
 		}
-		return IDEVICE_E_SUCCESS;
+
+		return error;
 	} else {
 		debug_info("Unknown connection type %d", connection->type);
 	}
@@ -407,13 +426,27 @@ static idevice_error_t internal_connection_receive_timeout(idevice_connection_t 
 
 LIBIMOBILEDEVICE_API idevice_error_t idevice_connection_receive_timeout(idevice_connection_t connection, char *data, uint32_t len, uint32_t *recv_bytes, unsigned int timeout)
 {
-	if (!connection || (connection->ssl_data && !connection->ssl_data->session)) {
+	if (!connection || (connection->ssl_data && !connection->ssl_data->session) || len == 0) {
 		return IDEVICE_E_INVALID_ARG;
 	}
 
 	if (connection->ssl_data) {
 		uint32_t received = 0;
+
 		while (received < len) {
+
+			int conn_error = socket_check_fd((int)(long)connection->data, FDM_READ, timeout);
+			idevice_error_t error = socket_recv_to_idevice_error(conn_error, len, received);
+
+			switch (error) {
+				case IDEVICE_E_SUCCESS:
+					break;
+				case IDEVICE_E_UNKNOWN_ERROR:
+					debug_info("ERROR: socket_check_fd returned %d (%s)", conn_error, strerror(-conn_error));
+				default:
+					return error;
+			}
+
 #ifdef HAVE_OPENSSL
 			int r = SSL_read(connection->ssl_data->session, (void*)((char*)(data+received)), (int)len-received);
 #else
@@ -425,13 +458,15 @@ LIBIMOBILEDEVICE_API idevice_error_t idevice_connection_receive_timeout(idevice_
 				break;
 			}
 		}
+
 		debug_info("SSL_read %d, received %d", len, received);
-		if (received > 0) {
-			*recv_bytes = received;
-			return IDEVICE_E_SUCCESS;
+		if (received < len) {
+			*recv_bytes = 0;
+			return IDEVICE_E_SSL_ERROR;
 		}
-		*recv_bytes = 0;
-		return IDEVICE_E_SSL_ERROR;
+		
+		*recv_bytes = received;
+		return IDEVICE_E_SUCCESS;
 	}
 	return internal_connection_receive_timeout(connection, data, len, recv_bytes, timeout);
 }
