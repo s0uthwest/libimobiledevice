@@ -36,6 +36,7 @@
 #include <usbmuxd.h>
 #ifdef HAVE_OPENSSL
 #include <openssl/err.h>
+#include <openssl/rsa.h>
 #include <openssl/ssl.h>
 #else
 #include <gnutls/gnutls.h>
@@ -48,6 +49,11 @@
 #include "common/debug.h"
 
 #ifdef HAVE_OPENSSL
+
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || \
+	(defined(LIBRESSL_VERSION_NUMBER) && (LIBRESSL_VERSION_NUMBER < 0x20020000L))
+#define TLS_method TLSv1_method
+#endif
 
 #if OPENSSL_VERSION_NUMBER < 0x10002000L || defined(LIBRESSL_VERSION_NUMBER)
 static void SSL_COMP_free_compression_methods(void)
@@ -79,12 +85,19 @@ static void locking_function(int mode, int n, const char* file, int line)
 		mutex_unlock(&mutex_buf[n]);
 }
 
+#if OPENSSL_VERSION_NUMBER < 0x10000000L
 static unsigned long id_function(void)
 {
 	return ((unsigned long)THREAD_ID);
 }
+#else
+static void id_function(CRYPTO_THREADID *thread)
+{
+	CRYPTO_THREADID_set_numeric(thread, (unsigned long)THREAD_ID);
+}
 #endif
 #endif
+#endif /* HAVE_OPENSSL */
 
 static void internal_idevice_init(void)
 {
@@ -99,7 +112,11 @@ static void internal_idevice_init(void)
 	for (i = 0; i < CRYPTO_num_locks(); i++)
 		mutex_init(&mutex_buf[i]);
 
+#if OPENSSL_VERSION_NUMBER < 0x10000000L
 	CRYPTO_set_id_callback(id_function);
+#else
+	CRYPTO_THREADID_set_callback(id_function);
+#endif
 	CRYPTO_set_locking_callback(locking_function);
 #endif
 #else
@@ -113,7 +130,11 @@ static void internal_idevice_deinit(void)
 #if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 	int i;
 	if (mutex_buf) {
+#if OPENSSL_VERSION_NUMBER < 0x10000000L
 		CRYPTO_set_id_callback(NULL);
+#else
+		CRYPTO_THREADID_set_callback(NULL);
+#endif
 		CRYPTO_set_locking_callback(NULL);
 		for (i = 0; i < CRYPTO_num_locks(); i++)
 			mutex_destroy(&mutex_buf[i]);
@@ -756,7 +777,7 @@ LIBIMOBILEDEVICE_API idevice_error_t idevice_connection_enable_ssl(idevice_conne
 	}
 	BIO_set_fd(ssl_bio, (int)(long)connection->data, BIO_NOCLOSE);
 
-	SSL_CTX *ssl_ctx = SSL_CTX_new(TLSv1_method());
+	SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_method());
 	if (ssl_ctx == NULL) {
 		debug_info("ERROR: Could not create SSL context.");
 		BIO_free(ssl_bio);
